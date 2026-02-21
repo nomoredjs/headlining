@@ -1,20 +1,20 @@
 /**
- * Resident Advisor gig scraper — PRIMARY source.
+ * Resident Advisor gig scraper.
  *
- * Scrapes public RA HTML pages directly — no GraphQL, no numeric ID.
+ * Step 1 — ID resolution (plain HTML, no auth):
+ *   Fetch https://ra.co/dj/{slug}
+ *   Pull numeric artist ID from the embedded __NEXT_DATA__ JSON blob.
+ *   Cache it in artists.ra_id so we never re-resolve.
  *
- * Pages:
- *   Past events:   https://ra.co/dj/{slug}/past-events?page=N
- *   Upcoming:      https://ra.co/dj/{slug}/tour-dates
+ * Step 2 — Event fetch (RA GraphQL, public endpoint):
+ *   POST https://ra.co/graphql with the resolved numeric ID.
+ *   Paginate past events and upcoming tour-dates separately.
+ *   Extract co-artists from every lineup.
  *
- * Slug format: artist name lowercased, all non-alphanumeric stripped.
- *   "Dom Dolla" → "domdolla"
- *   "Carl Cox"  → "carlcox"
- *   "Amelie Lens" → "amelielens"
- *
- * Each page is a Next.js SSR page — event data lives in the
- * __NEXT_DATA__ <script> tag as JSON. Cheerio HTML parsing is the
- * fallback if __NEXT_DATA__ doesn't yield events.
+ * Slug format: lowercase artist name, all non-alphanumeric removed.
+ *   "Dom Dolla"  → "domdolla"
+ *   "Carl Cox"   → "carlcox"
+ *   "Amelie Lens"→ "amelielens"
  *
  * Usage:
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts dom-dolla
@@ -27,314 +27,263 @@ import { getSupabase } from "./lib/supabase.js";
 import { inferGigType } from "./lib/gig-utils.js";
 
 const RATE_LIMIT_MS = 2000;
-const MAX_PAGES     = 100; // 100 pages × ~20 events = 2 000 max
+const PAGE_SIZE     = 50;   // max RA allows per GraphQL page
+const MAX_PAGES     = 100;
 
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+const RA_GRAPHQL = "https://ra.co/graphql";
+
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── RA slug ───────────────────────────────────────────────────────────────────
-// RA slugs are the artist name lowercased with everything non-alphanumeric removed.
+// ─── Slug ─────────────────────────────────────────────────────────────────────
 
 function toRaSlug(artistName: string): string {
   return artistName.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-// ── Fetch ─────────────────────────────────────────────────────────────────────
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 async function fetchHtml(url: string): Promise<string | null> {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        Referer: "https://ra.co/",
-      },
-    });
-    if (!res.ok) {
-      console.log(`    HTTP ${res.status} for ${url}`);
-      return null;
-    }
-    return res.text();
-  } catch (err) {
-    console.log(`    Fetch error: ${(err as Error).message}`);
-    return null;
-  }
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":      UA,
+      "Accept":          "text/html,application/xhtml+xml,*/*;q=0.9",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer":         "https://ra.co/",
+    },
+  });
+  if (!res.ok) { console.log(`  HTTP ${res.status}  ${url}`); return null; }
+  return res.text();
 }
 
-// ── Structured event type ─────────────────────────────────────────────────────
-
-interface RaEvent {
-  date: string;        // YYYY-MM-DD
-  eventName: string;
-  venueName: string;
-  venueCity: string;
-  venueCountry: string;
-  coArtists: string[];
+async function postGraphql(body: object): Promise<unknown> {
+  const res = await fetch(RA_GRAPHQL, {
+    method: "POST",
+    headers: {
+      "User-Agent":   UA,
+      "Content-Type": "application/json",
+      "Accept":       "application/json",
+      "Origin":       "https://ra.co",
+      "Referer":      "https://ra.co/",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
+  return res.json();
 }
 
-// ── __NEXT_DATA__ parser ──────────────────────────────────────────────────────
-// RA is a Next.js app. All SSR data is embedded in <script id="__NEXT_DATA__">.
-// The event array can live at several paths depending on RA's version/page type.
+// ─── Step 1: resolve numeric RA ID from __NEXT_DATA__ ─────────────────────────
+// The artist page embeds all SSR props inside <script id="__NEXT_DATA__">.
+// The numeric ID appears at several paths — we walk the whole tree and collect
+// every "id"-shaped value, then pick the one that appears in artist context.
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractFromNextData(raw: string, targetArtistName: string): RaEvent[] {
+async function resolveRaId(slug: string, artistName: string): Promise<string | null> {
+  const url  = `https://ra.co/dj/${slug}`;
+  console.log(`  Resolving RA ID from ${url}`);
+  const html = await fetchHtml(url);
+  if (!html) return null;
+
+  const $ = cheerio.load(html);
+  const raw = $("#__NEXT_DATA__").html() ?? "";
+  if (!raw) { console.log("  __NEXT_DATA__ not found"); return null; }
+
   let nd: Record<string, unknown>;
-  try { nd = JSON.parse(raw); } catch { return []; }
+  try { nd = JSON.parse(raw); }
+  catch { console.log("  Failed to parse __NEXT_DATA__"); return null; }
 
-  // Walk the JSON looking for an array of objects that look like RA event listings
-  const candidates: unknown[] = [];
+  // Walk the tree and collect any numeric values stored under keys named "id"
+  // that are plausible RA artist IDs (4–6 digit integers).
+  const candidates: number[] = [];
 
-  function walk(val: unknown, depth = 0): void {
-    if (depth > 10 || !val || typeof val !== "object") return;
-    if (Array.isArray(val)) {
-      // If this array looks like event listings, save it
-      if (val.length > 0 && isLikelyEventArray(val)) candidates.push(val);
-      val.forEach(v => walk(v, depth + 1));
-    } else {
-      Object.values(val as Record<string, unknown>).forEach(v => walk(v, depth + 1));
+  function walk(val: unknown, parentKey = ""): void {
+    if (val === null || val === undefined) return;
+    if (typeof val === "number") {
+      if (parentKey === "id" && val > 1000 && val < 9_999_999) candidates.push(val);
+      return;
+    }
+    if (typeof val === "string") {
+      if (parentKey === "id" && /^\d{4,7}$/.test(val)) candidates.push(Number(val));
+      return;
+    }
+    if (Array.isArray(val)) { val.forEach(v => walk(v, parentKey)); return; }
+    if (typeof val === "object") {
+      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        walk(v, k);
+      }
     }
   }
 
   walk(nd);
 
-  // Score and pick the best candidate (largest array of event-shaped objects)
-  const best = candidates
-    .map(c => c as unknown[])
-    .sort((a, b) => b.length - a.length)[0];
+  if (!candidates.length) {
+    console.log("  No numeric IDs found in __NEXT_DATA__");
+    return null;
+  }
 
-  if (!best) return [];
+  // The artist's own ID is usually the most-repeated value, or the first one
+  // encountered under props.pageProps.
+  const freq: Record<number, number> = {};
+  for (const n of candidates) freq[n] = (freq[n] ?? 0) + 1;
 
-  return best.flatMap(item => parseNextDataEvent(item as Record<string, unknown>, targetArtistName));
-}
+  // Try the direct path first
+  const pp = (nd as Record<string, unknown>)?.props as Record<string, unknown>;
+  const directId =
+    (pp?.pageProps as Record<string, unknown>)?.data?.artist?.id ??
+    (pp?.pageProps as Record<string, unknown>)?.artist?.id;
 
-function isLikelyEventArray(arr: unknown[]): boolean {
-  // Check if first element has date + venue-like fields
-  const first = arr[0] as Record<string, unknown>;
-  if (!first || typeof first !== "object") return false;
-  const keys = Object.keys(first);
-  return (
-    keys.some(k => ["date", "startTime", "listingDate", "eventDate"].includes(k)) &&
-    keys.some(k => ["venue", "title", "name", "eventName"].includes(k))
-  );
-}
+  if (directId && typeof directId === "number") {
+    console.log(`  Found RA ID (direct path): ${directId}`);
+    return String(directId);
+  }
 
-function parseNextDataEvent(
-  item: Record<string, unknown>,
-  targetArtistName: string,
-): RaEvent[] {
-  // Normalise the various shapes RA has used
-  const event = (item.event as Record<string, unknown>) ?? item;
+  // Fall back: most frequent ID
+  const best = Object.entries(freq).sort((a, b) => b[1] - a[1])[0];
+  if (best) {
+    console.log(`  Found RA ID (most-frequent): ${best[0]}  (seen ${best[1]}×)`);
+    return best[0];
+  }
 
-  // Date
-  const rawDate =
-    (event.date as string) ??
-    (event.startTime as string) ??
-    (event.listingDate as string) ??
-    (item.startTime as string) ??
-    (item.date as string) ?? "";
-  const date = rawDate.slice(0, 10);
-  if (!date || !/^\d{4}-\d{2}-\d{2}/.test(date)) return [];
-
-  // Title / event name
-  const eventName =
-    (event.title as string) ??
-    (event.name as string) ??
-    (item.title as string) ?? "";
-
-  // Venue
-  const venueObj =
-    (event.venue as Record<string, unknown>) ??
-    (item.venue as Record<string, unknown>) ?? null;
-  const venueName    = (venueObj?.name as string) ?? "";
-  const areaObj      = venueObj?.area as Record<string, unknown> | undefined;
-  const venueCity    = (areaObj?.name as string) ?? "";
-  const venueCountry = ((areaObj?.country as Record<string, unknown>)?.name as string) ?? "";
-
-  // Artists / lineup
-  const artistsRaw =
-    (event.artists as Array<Record<string, unknown>>) ??
-    (event.lineup as Array<Record<string, unknown>>) ??
-    (item.artists as Array<Record<string, unknown>>) ?? [];
-
-  const coArtists = artistsRaw
-    .map(a => (a.name as string) ?? (a.artistName as string) ?? "")
-    .filter(n => n && n.toLowerCase() !== targetArtistName.toLowerCase());
-
-  if (!venueName && !eventName) return [];
-
-  return [{ date, eventName, venueName, venueCity, venueCountry, coArtists }];
-}
-
-// ── HTML cheerio fallback ─────────────────────────────────────────────────────
-// If __NEXT_DATA__ doesn't yield events, parse the visible DOM.
-// RA's CSS class names are auto-generated so we use structural + attribute selectors.
-
-function extractFromHtml(html: string, targetArtistName: string): RaEvent[] {
-  const $ = cheerio.load(html);
-  const events: RaEvent[] = [];
-
-  // RA renders each event as a linked card — look for links to /events/...
-  $("a[href*='/events/']").each((_, el) => {
-    const $el = $(el);
-    const text = $el.text().trim();
-    if (!text) return;
-
-    // Date: <time> element with datetime attribute anywhere inside the card
-    const timeEl = $el.find("time[datetime]").first();
-    const rawDate = timeEl.attr("datetime") ?? timeEl.attr("data-date") ?? "";
-    const date = rawDate.slice(0, 10);
-    if (!date || !/^\d{4}-\d{2}-\d{2}/.test(date)) {
-      // Try parsing visible date text
-      const dateText = timeEl.text().trim() || $el.find("[class*='date'], [class*='Date']").first().text().trim();
-      const parsed = parseDateText(dateText);
-      if (!parsed) return;
-    }
-
-    const resolvedDate = date || parseDateText(timeEl.text()) || "";
-    if (!resolvedDate) return;
-
-    // Event name: first heading or prominent text element
-    const headings = $el.find("h1,h2,h3,h4,strong,[class*='title'],[class*='Title'],[class*='name'],[class*='Name']");
-    const eventName = headings.first().text().trim();
-
-    // Venue + location — RA often puts these in separate spans/divs
-    const allText = $el.find("*").map((_, e) => $(e).text().trim()).get()
-      .filter(t => t.length > 2 && t.length < 60);
-
-    // Heuristic: venue name is typically first medium-length text after event name
-    const venueName = allText.find(t =>
-      t !== eventName && !t.match(/^\d/) && t.length > 3
-    ) ?? "";
-
-    // Location: text containing a comma (City, Country format)
-    const locationText = allText.find(t => t.includes(",") && t.length < 50) ?? "";
-    const locParts   = locationText.split(",").map(s => s.trim());
-    const venueCity    = locParts[0] ?? "";
-    const venueCountry = locParts[locParts.length - 1] ?? "";
-
-    // Co-artists: often listed as comma-separated names at the bottom of the card
-    const lineupText = $el.find("[class*='lineup'],[class*='Lineup'],[class*='artist'],[class*='Artist']")
-      .last().text().trim();
-    const coArtists = lineupText
-      .split(/[,·•\n]/)
-      .map(s => s.trim())
-      .filter(n => n && n.toLowerCase() !== targetArtistName.toLowerCase() && n.length < 50);
-
-    if (resolvedDate && (eventName || venueName)) {
-      events.push({ date: resolvedDate, eventName, venueName, venueCity, venueCountry, coArtists });
-    }
-  });
-
-  return events;
-}
-
-function parseDateText(text: string): string | null {
-  if (!text) return null;
-  const d = new Date(text);
-  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
   return null;
 }
 
-// ── Fetch and parse one page ──────────────────────────────────────────────────
+// ─── Step 2: GraphQL pagination ───────────────────────────────────────────────
 
-async function parsePage(url: string, artistName: string): Promise<{ events: RaEvent[]; hasMore: boolean }> {
-  const html = await fetchHtml(url);
-  if (!html) return { events: [], hasMore: false };
-
-  const $ = cheerio.load(html);
-  const nextDataRaw = $("#__NEXT_DATA__").html() ?? "";
-
-  // Try __NEXT_DATA__ first
-  let events = extractFromNextData(nextDataRaw, artistName);
-
-  if (events.length === 0) {
-    // Fall back to HTML parsing
-    events = extractFromHtml(html, artistName);
-  }
-
-  // RA paginates — detect if there's a next page
-  const hasNextLink =
-    $("a[rel='next']").length > 0 ||
-    $("[class*='pagination'] a[aria-label*='Next'], [class*='pagination'] a[aria-label*='next']").length > 0;
-
-  // Also treat as "has more" if we got a full-looking page (≥10 events)
-  const hasMore = hasNextLink || events.length >= 10;
-
-  return { events, hasMore };
+interface RaGqlEvent {
+  id: string;
+  date: string;
+  title: string;
+  venue: { name: string; area: { name: string; country: { name: string } } };
+  artists: Array<{ name: string }>;
 }
 
-// ── Scrape all past-events pages ──────────────────────────────────────────────
+// DATERANGE filter value — JSON-stringified because RA wraps it that way
+const NOW_GTE = JSON.stringify({ gte: new Date().toISOString() });
+const NOW_LTE = JSON.stringify({ lte: new Date().toISOString() });
 
-async function scrapeAllPages(raSlug: string, artistName: string): Promise<RaEvent[]> {
-  const all: RaEvent[] = [];
+async function fetchEventsPage(
+  raId: string,
+  direction: "past" | "upcoming",
+  page: number,
+): Promise<{ events: RaGqlEvent[]; total: number }> {
+  const dateFilter = direction === "past"
+    ? { type: "DATERANGE", value: NOW_LTE }
+    : { type: "DATERANGE", value: NOW_GTE };
 
-  // 1. Past events (paginated)
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const url = `https://ra.co/dj/${raSlug}/past-events?page=${page}`;
-    console.log(`  Page ${page}: ${url}`);
+  const artistFilter = { type: "ARTIST", value: raId };
 
-    const { events, hasMore } = await parsePage(url, artistName);
-    console.log(`  Page ${page}: ${events.length} events (total ${all.length + events.length})`);
-
-    if (events.length === 0) {
-      // Print HTML snippet for diagnosis when we expected more events
-      if (page === 1) {
-        const html = await fetchHtml(url);
-        if (html) {
-          const snippet = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
-          console.log(`  Page 1 HTML preview: ${snippet}`);
+  const body = {
+    operationName: "GET_DEFAULT_EVENTS_LISTING",
+    variables: {
+      indices:      ["EVENT"],
+      pageSize:     PAGE_SIZE,
+      page,
+      aggregations: ["YEAR", "COUNTRY"],
+      baseFilters:  [artistFilter, dateFilter],
+      filters:      [artistFilter, dateFilter],
+      sortField:    direction === "past" ? "EVENTDATE" : "EVENTDATE",
+      sortOrder:    direction === "past" ? "DESCENDING" : "ASCENDING",
+    },
+    query: `
+      query GET_DEFAULT_EVENTS_LISTING(
+        $indices: [IndexType!]!
+        $aggregations: [ListingAggregationType!]
+        $filters: [FilterInput]
+        $baseFilters: [FilterInput]
+        $pageSize: Int
+        $page: Int
+        $sortField: FilterSortField
+        $sortOrder: FilterSortOrder
+      ) {
+        listing(filter: {
+          indices: $indices
+          aggregations: $aggregations
+          filters: $filters
+          baseFilters: $baseFilters
+          pageSize: $pageSize
+          page: $page
+          sortField: $sortField
+          sortOrder: $sortOrder
+        }) {
+          data {
+            ... on Event {
+              id
+              date: startTime
+              title
+              venue { name area { name country { name } } }
+              artists { name }
+            }
+          }
+          totalResults
         }
       }
-      console.log(`  No events on page ${page} — stopping.`);
-      break;
+    `,
+  };
+
+  const json = (await postGraphql(body)) as Record<string, unknown>;
+  const listing = (json?.data as Record<string, unknown>)?.listing as Record<string, unknown>;
+  const data     = (listing?.data   as RaGqlEvent[]) ?? [];
+  const total    = (listing?.totalResults as number) ?? 0;
+  return { events: data, total };
+}
+
+async function fetchAllEvents(raId: string): Promise<RaGqlEvent[]> {
+  const all: RaGqlEvent[] = [];
+
+  for (const direction of ["past", "upcoming"] as const) {
+    console.log(`\n  Fetching ${direction} events…`);
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const { events, total } = await fetchEventsPage(raId, direction, page);
+      console.log(`    Page ${page}: ${events.length} events  (${all.length + events.length} / ${total} total)`);
+      all.push(...events);
+      if (events.length < PAGE_SIZE || all.length >= total) break;
+      await sleep(RATE_LIMIT_MS);
     }
-
-    all.push(...events);
-    if (!hasMore) { console.log(`  No next page — done.`); break; }
-
-    await sleep(RATE_LIMIT_MS);
   }
-
-  // 2. Upcoming / tour dates (single page, no pagination)
-  await sleep(RATE_LIMIT_MS);
-  const tourUrl = `https://ra.co/dj/${raSlug}/tour-dates`;
-  console.log(`  Upcoming: ${tourUrl}`);
-  const { events: upcoming } = await parsePage(tourUrl, artistName);
-  console.log(`  Upcoming: ${upcoming.length} events`);
-  all.push(...upcoming);
 
   return all;
 }
 
-// ── Upsert to DB ──────────────────────────────────────────────────────────────
+// ─── Normalise GQL event → our row shape ─────────────────────────────────────
+
+function normalise(e: RaGqlEvent, targetArtistName: string) {
+  const date         = (e.date ?? "").slice(0, 10);
+  const venueName    = e.venue?.name ?? "";
+  const venueCity    = e.venue?.area?.name ?? "";
+  const venueCountry = e.venue?.area?.country?.name ?? "";
+  const coArtists    = (e.artists ?? [])
+    .map(a => a.name)
+    .filter(n => n && n.toLowerCase() !== targetArtistName.toLowerCase());
+
+  return {
+    date,
+    event_name:    e.title ?? "",
+    venue_name:    venueName,
+    venue_city:    venueCity,
+    venue_country: venueCountry,
+    gig_type:      inferGigType(e.title ?? "", venueName),
+    co_artists:    coArtists,
+    source:        "ra",
+  };
+}
+
+// ─── Upsert ───────────────────────────────────────────────────────────────────
 
 const BATCH = 100;
 
 async function upsertGigs(
   artistId: string,
-  events: RaEvent[],
+  artistName: string,
+  events: RaGqlEvent[],
 ): Promise<{ inserted: number; errors: number }> {
   const sb = getSupabase();
-  let inserted = 0;
-  let errors   = 0;
+  let inserted = 0, errors = 0;
 
   const rows = events
-    .filter(e => e.date && (e.venueName || e.eventName))
-    .map(e => ({
-      artist_id:     artistId,
-      date:          e.date,
-      venue_name:    e.venueName || e.eventName,
-      venue_city:    e.venueCity,
-      venue_country: e.venueCountry,
-      event_name:    e.eventName,
-      gig_type:      inferGigType(e.eventName, e.venueName),
-      co_artists:    e.coArtists,
-      source:        "ra",
-    }));
+    .map(e => ({ artist_id: artistId, ...normalise(e, artistName) }))
+    .filter(r => r.date && r.venue_name);
 
   for (let i = 0; i < rows.length; i += BATCH) {
     const batch = rows.slice(i, i + BATCH);
@@ -343,56 +292,78 @@ async function upsertGigs(
       .upsert(batch, { onConflict: "artist_id,date,venue_name", ignoreDuplicates: false })
       .select("id", { count: "exact", head: true });
 
-    if (error) { console.warn(`  Batch error:`, error.message); errors += batch.length; }
+    if (error) { console.warn("  Batch error:", error.message); errors += batch.length; }
     else inserted += count ?? batch.length;
   }
 
   return { inserted, errors };
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ─── Process one artist ───────────────────────────────────────────────────────
 
 async function processArtist(slug: string, dryRun: boolean) {
   const sb = getSupabase();
 
   const { data: artist, error } = await sb
     .from("artists")
-    .select("id, name")
+    .select("id, name, ra_id")
     .eq("slug", slug)
     .single();
 
-  if (error || !artist) { console.error(`Artist not found in DB: ${slug}`); return; }
+  if (error || !artist) { console.error(`Artist not found: ${slug}`); return; }
 
   const raSlug = toRaSlug(artist.name);
-  console.log(`\n▶ ${artist.name}  →  ra.co/dj/${raSlug}${dryRun ? "  [DRY RUN]" : ""}`);
+  console.log(`\n▶ ${artist.name}  slug=${raSlug}${dryRun ? "  [DRY RUN]" : ""}`);
 
-  const events = await scrapeAllPages(raSlug, artist.name);
-  console.log(`\n  Total: ${events.length} events`);
+  // ── Step 1: resolve numeric ID ─────────────────────────────────────────────
+  let raId: string = artist.ra_id ?? "";
+
+  if (!raId) {
+    await sleep(RATE_LIMIT_MS);
+    raId = (await resolveRaId(raSlug, artist.name)) ?? "";
+    if (!raId) { console.error("  Could not resolve RA ID — skipping"); return; }
+
+    if (!dryRun) {
+      await sb.from("artists").update({ ra_id: raId }).eq("id", artist.id);
+      console.log(`  Cached ra_id=${raId} in DB`);
+    }
+  } else {
+    console.log(`  Using cached ra_id=${raId}`);
+  }
+
+  // ── Step 2: fetch all events via GraphQL ───────────────────────────────────
+  await sleep(RATE_LIMIT_MS);
+  const events = await fetchAllEvents(raId);
+  console.log(`\n  Total events: ${events.length}`);
 
   if (!events.length) return;
 
-  // Print sample
+  // Sample
   for (const e of events.slice(0, 5)) {
-    const co = e.coArtists.length ? `  with: ${e.coArtists.slice(0, 3).join(", ")}` : "";
-    console.log(`    ${e.date}  ${(e.venueName || e.eventName).slice(0, 35).padEnd(35)}  ${e.venueCity}, ${e.venueCountry}${co}`);
+    const r  = normalise(e, artist.name);
+    const co = r.co_artists.length ? `  with: ${r.co_artists.slice(0, 3).join(", ")}` : "";
+    console.log(`  ${r.date}  ${r.venue_name.slice(0, 35).padEnd(35)}  ${r.venue_city}, ${r.venue_country}${co}`);
   }
-  if (events.length > 5) console.log(`    ... and ${events.length - 5} more`);
+  if (events.length > 5) console.log(`  … and ${events.length - 5} more`);
 
   if (dryRun) { console.log("\n  [dry-run] skipping DB write"); return; }
 
-  const { inserted, errors } = await upsertGigs(artist.id, events);
+  const { inserted, errors } = await upsertGigs(artist.id, artist.name, events);
   console.log(`\n  ✅ ${inserted} inserted/updated, ${errors} errors`);
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 async function main() {
-  const args = process.argv.slice(2);
-  if (!args.length) {
+  const args    = process.argv.slice(2);
+  const dryRun  = args.includes("--dry-run");
+  const targets = args.filter(a => a !== "--dry-run");
+
+  if (!targets.length) {
     console.error("Usage: scrape-ra-v2.ts [--dry-run] <slug|--all>");
     process.exit(1);
   }
 
-  const dryRun  = args.includes("--dry-run");
-  const targets = args.filter(a => a !== "--dry-run");
   const sb = getSupabase();
 
   if (targets[0] === "--all") {
