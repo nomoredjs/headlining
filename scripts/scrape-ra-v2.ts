@@ -20,6 +20,8 @@
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts dom-dolla
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --all
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --dry-run dom-dolla
+ *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --debug dom-dolla   ← dumps raw GQL response
+ *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --reset-id dom-dolla ← clears bad cached ID
  */
 
 import * as cheerio from "cheerio";
@@ -59,20 +61,30 @@ async function fetchHtml(url: string): Promise<string | null> {
   return res.text();
 }
 
+let DEBUG = false;
+
 async function postGraphql(body: object): Promise<unknown> {
   const res = await fetch(RA_GRAPHQL, {
     method: "POST",
     headers: {
-      "User-Agent":   UA,
-      "Content-Type": "application/json",
-      "Accept":       "application/json",
-      "Origin":       "https://ra.co",
-      "Referer":      "https://ra.co/",
+      "User-Agent":      UA,
+      "Content-Type":    "application/json",
+      "Accept":          "application/json",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Origin":          "https://ra.co",
+      "Referer":         "https://ra.co/",
+      "ra-country":      "AU",
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
-  return res.json();
+  if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  if (DEBUG) {
+    console.log("\n  ── raw GraphQL response ──");
+    console.log(JSON.stringify(json, null, 2).slice(0, 3000));
+    console.log("  ──────────────────────────\n");
+  }
+  return json;
 }
 
 // ─── Step 1: resolve numeric RA ID from __NEXT_DATA__ ─────────────────────────
@@ -301,7 +313,7 @@ async function upsertGigs(
 
 // ─── Process one artist ───────────────────────────────────────────────────────
 
-async function processArtist(slug: string, dryRun: boolean) {
+async function processArtist(slug: string, dryRun: boolean, resetId: boolean) {
   const sb = getSupabase();
 
   const { data: artist, error } = await sb
@@ -316,7 +328,15 @@ async function processArtist(slug: string, dryRun: boolean) {
   console.log(`\n▶ ${artist.name}  slug=${raSlug}${dryRun ? "  [DRY RUN]" : ""}`);
 
   // ── Step 1: resolve numeric ID ─────────────────────────────────────────────
-  let raId: string = artist.ra_id ?? "";
+  // A valid RA ID is digits-only (4–7 chars). Reject anything else (e.g. "91935dlining").
+  const cachedId = artist.ra_id ?? "";
+  const isValidId = /^\d{4,7}$/.test(cachedId);
+
+  if (cachedId && !isValidId) {
+    console.warn(`  ⚠ Corrupted ra_id in DB: "${cachedId}" — will re-resolve`);
+  }
+
+  let raId = (!resetId && isValidId) ? cachedId : "";
 
   if (!raId) {
     await sleep(RATE_LIMIT_MS);
@@ -355,12 +375,14 @@ async function processArtist(slug: string, dryRun: boolean) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const args    = process.argv.slice(2);
-  const dryRun  = args.includes("--dry-run");
-  const targets = args.filter(a => a !== "--dry-run");
+  const args     = process.argv.slice(2);
+  const dryRun   = args.includes("--dry-run");
+  const resetId  = args.includes("--reset-id");
+  DEBUG          = args.includes("--debug");
+  const targets  = args.filter(a => !a.startsWith("--"));
 
   if (!targets.length) {
-    console.error("Usage: scrape-ra-v2.ts [--dry-run] <slug|--all>");
+    console.error("Usage: scrape-ra-v2.ts [--dry-run] [--debug] [--reset-id] <slug|--all>");
     process.exit(1);
   }
 
@@ -369,11 +391,11 @@ async function main() {
   if (targets[0] === "--all") {
     const { data: artists } = await sb.from("artists").select("slug").order("name");
     for (const a of artists ?? []) {
-      await processArtist(a.slug, dryRun);
+      await processArtist(a.slug, dryRun, resetId);
       await sleep(RATE_LIMIT_MS);
     }
   } else {
-    await processArtist(targets[0], dryRun);
+    await processArtist(targets[0], dryRun, resetId);
   }
 
   console.log("\nDone.");
