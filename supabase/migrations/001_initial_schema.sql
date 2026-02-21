@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_releases_artist_id ON releases(artist_id);
+ALTER TABLE releases ADD CONSTRAINT IF NOT EXISTS releases_artist_title_unique UNIQUE (artist_id, title);
 
 -- ─────────────────────────────────────────────────────────────
 -- ARTIST CONNECTIONS  (network graph)

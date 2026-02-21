@@ -13,7 +13,9 @@ import * as cheerio from "cheerio";
 import { getSupabase } from "./lib/supabase.js";
 import { inferGigType } from "./lib/gig-utils.js";
 
-const RATE_LIMIT_MS = 2000; // 2 s between requests
+const RATE_LIMIT_MS = 2000;   // 2 s between requests
+const EVENTS_PER_PAGE = 50;   // Songkick shows up to 50 events per page
+const MAX_PAGES = 200;         // safety cap (200 × 50 = 10 000 gigs)
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -127,77 +129,88 @@ function parseGigPage(html: string): RawGig[] {
 
 async function scrapeAllGigs(songkickId: string): Promise<RawGig[]> {
   const allGigs: RawGig[] = [];
-  let page = 1;
-  let hasMore = true;
 
-  while (hasMore) {
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const url = `https://www.songkick.com/artists/${songkickId}/gigography?page=${page}`;
-    console.log(`  Fetching page ${page}: ${url}`);
+    console.log(`  Page ${page}: ${url}`);
 
+    let html: string;
     try {
-      const html = await fetchHtml(url);
-      const gigs = parseGigPage(html);
-
-      if (gigs.length === 0) {
-        hasMore = false;
-      } else {
-        allGigs.push(...gigs);
-        page++;
-
-        // Check if there's a next page
-        const $ = cheerio.load(html);
-        const nextLink = $("a[rel=next], .pagination .next a, a:contains('Next')").attr("href");
-        if (!nextLink) hasMore = false;
-      }
+      html = await fetchHtml(url);
     } catch (err) {
-      console.warn(`  Page ${page} failed:`, err);
-      hasMore = false;
+      console.warn(`  Page ${page} HTTP error — stopping:`, (err as Error).message);
+      break;
     }
 
-    if (hasMore) await sleep(RATE_LIMIT_MS);
+    const gigs = parseGigPage(html);
+    allGigs.push(...gigs);
+    console.log(`    → ${gigs.length} gigs (${allGigs.length} total so far)`);
+
+    // Determine whether there's a next page.
+    // Songkick shows a rel=next link when more pages exist.
+    // Fall back to: if we got a full page (≥ EVENTS_PER_PAGE), keep going.
+    const $ = cheerio.load(html);
+    const hasNextLink =
+      $("a[rel='next']").length > 0 ||
+      $(".pagination a").filter((_, el) => {
+        const href = $(el).attr("href") ?? "";
+        return href.includes(`page=${page + 1}`);
+      }).length > 0;
+
+    const likelyMorePages = gigs.length >= EVENTS_PER_PAGE;
+
+    if (!hasNextLink && !likelyMorePages) {
+      console.log(`  No next page detected — done.`);
+      break;
+    }
+
+    await sleep(RATE_LIMIT_MS);
   }
 
   return allGigs;
 }
 
-// ── Upsert gigs into Supabase ─────────────────────────────────────────────────
+// ── Upsert gigs into Supabase (batched for speed) ────────────────────────────
+
+const BATCH_SIZE = 100;
 
 async function upsertGigs(
   artistId: string,
   gigs: RawGig[]
-): Promise<{ inserted: number; skipped: number }> {
+): Promise<{ inserted: number; errors: number }> {
   const sb = getSupabase();
   let inserted = 0;
-  let skipped = 0;
+  let errors = 0;
 
-  for (const gig of gigs) {
-    const gigType = inferGigType(gig.eventName, gig.venueName);
+  const rows = gigs.map((g) => ({
+    artist_id: artistId,
+    date: g.date,
+    venue_name: g.venueName || g.eventName,
+    venue_city: g.venueCity,
+    venue_country: g.venueCountry,
+    event_name: g.eventName,
+    billing_position: g.billingPosition,
+    gig_type: inferGigType(g.eventName, g.venueName),
+    is_sold_out: g.isSoldOut,
+    source: "songkick",
+  }));
 
-    const { error } = await sb.from("gigs").upsert(
-      {
-        artist_id: artistId,
-        date: gig.date,
-        venue_name: gig.venueName || gig.eventName,
-        venue_city: gig.venueCity,
-        venue_country: gig.venueCountry,
-        event_name: gig.eventName,
-        billing_position: gig.billingPosition,
-        gig_type: gigType,
-        is_sold_out: gig.isSoldOut,
-        source: "songkick",
-      },
-      // Deduplicate on artist + date + venue name
-      { onConflict: "artist_id,date,venue_name", ignoreDuplicates: true }
-    );
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const batch = rows.slice(i, i + BATCH_SIZE);
+    const { error, count } = await sb
+      .from("gigs")
+      .upsert(batch, { onConflict: "artist_id,date,venue_name", ignoreDuplicates: true })
+      .select("id", { count: "exact", head: true });
 
     if (error) {
-      skipped++;
+      console.warn(`  Batch ${i / BATCH_SIZE + 1} error:`, error.message);
+      errors += batch.length;
     } else {
-      inserted++;
+      inserted += count ?? batch.length;
     }
   }
 
-  return { inserted, skipped };
+  return { inserted, errors };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -258,8 +271,8 @@ async function processSingleArtist(slug: string) {
   console.log(`    ... and ${Math.max(0, gigs.length - 5)} more`);
 
   // Upsert
-  const { inserted, skipped } = await upsertGigs(artist.id, gigs);
-  console.log(`\n  ✅ ${inserted} inserted, ${skipped} skipped (duplicates/errors)`);
+  const { inserted, errors } = await upsertGigs(artist.id, gigs);
+  console.log(`\n  ✅ ${inserted} inserted, ${errors} errors`);
 }
 
 async function main() {
