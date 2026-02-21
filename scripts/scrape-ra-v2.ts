@@ -51,10 +51,20 @@ function toRaSlug(artistName: string): string {
 async function fetchHtml(url: string): Promise<string | null> {
   const res = await fetch(url, {
     headers: {
-      "User-Agent":      UA,
-      "Accept":          "text/html,application/xhtml+xml,*/*;q=0.9",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Referer":         "https://ra.co/",
+      "User-Agent":                UA,
+      "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language":           "en-US,en;q=0.9",
+      "Accept-Encoding":           "gzip, deflate, br",
+      "Cache-Control":             "max-age=0",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest":            "document",
+      "Sec-Fetch-Mode":            "navigate",
+      "Sec-Fetch-Site":            "none",
+      "Sec-Fetch-User":            "?1",
+      "Sec-CH-UA":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "Sec-CH-UA-Mobile":          "?0",
+      "Sec-CH-UA-Platform":        '"macOS"',
+      "Connection":                "keep-alive",
     },
   });
   if (!res.ok) { console.log(`  HTTP ${res.status}  ${url}`); return null; }
@@ -97,31 +107,63 @@ async function postGraphql(body: object): Promise<unknown> {
 //   Kept as fallback in case the GraphQL schema changes.
 
 async function resolveRaIdViaGraphql(slug: string): Promise<string | null> {
-  console.log(`  Trying GraphQL artist lookup for slug="${slug}"`);
-  try {
-    const body = {
-      operationName: "GET_ARTIST_PROFILE",
-      variables: { slug },
-      query: `
-        query GET_ARTIST_PROFILE($slug: String!) {
-          artist(slug: $slug) {
-            id
-            name
-            urlName
+  // RA's schema uses "urlName" as the artist lookup argument (not "slug").
+  // We also try the bare "slug" variant in case it works.
+  const queries = [
+    {
+      label: "urlName",
+      body: {
+        operationName: "GET_ARTIST_PROFILE",
+        variables: { urlName: slug },
+        query: `
+          query GET_ARTIST_PROFILE($urlName: String!) {
+            artist(urlName: $urlName) {
+              id
+              name
+              urlName
+            }
           }
-        }
-      `,
-    };
-    const json = (await postGraphql(body)) as Record<string, unknown>;
-    const artist = (json?.data as Record<string, unknown>)?.artist as Record<string, unknown> | null;
-    const id = artist?.id;
-    if (typeof id === "number" || (typeof id === "string" && /^\d{4,7}$/.test(String(id)))) {
-      console.log(`  Found RA ID via GraphQL: ${id}  (name=${artist?.name})`);
-      return String(id);
+        `,
+      },
+    },
+    {
+      label: "slug",
+      body: {
+        operationName: "GET_ARTIST_PROFILE",
+        variables: { slug },
+        query: `
+          query GET_ARTIST_PROFILE($slug: String!) {
+            artist(slug: $slug) {
+              id
+              name
+              urlName
+            }
+          }
+        `,
+      },
+    },
+  ];
+
+  for (const { label, body } of queries) {
+    console.log(`  Trying GraphQL artist lookup (${label}="${slug}")`);
+    try {
+      const json = (await postGraphql(body)) as Record<string, unknown>;
+      if (DEBUG) console.log("  GraphQL response:", JSON.stringify(json, null, 2).slice(0, 600));
+
+      // Surface any GraphQL-level errors so we can debug
+      const errs = (json as Record<string, unknown>).errors as Array<{message: string}> | undefined;
+      if (errs?.length) console.log(`  GraphQL errors: ${errs.map(e => e.message).join("; ")}`);
+
+      const artist = (json?.data as Record<string, unknown>)?.artist as Record<string, unknown> | null;
+      const id = artist?.id;
+      if (typeof id === "number" || (typeof id === "string" && /^\d+$/.test(String(id)))) {
+        console.log(`  Found RA ID via GraphQL (${label}): ${id}  (name=${artist?.name})`);
+        return String(id);
+      }
+    } catch (err) {
+      console.log(`  GraphQL lookup (${label}) failed: ${(err as Error).message}`);
     }
-    if (DEBUG) console.log("  GraphQL response:", JSON.stringify(json, null, 2).slice(0, 500));
-  } catch (err) {
-    console.log(`  GraphQL lookup failed: ${(err as Error).message}`);
+    await sleep(500);
   }
   return null;
 }
