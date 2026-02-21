@@ -128,12 +128,14 @@ function parseGigPage(html: string): RawGig[] {
 // Stop condition: a page returns 0 events.  Never rely on page-count guesses
 // because Songkick's page size isn't always 50 and its next-link markup varies.
 
-async function scrapeAllGigs(songkickId: string, dryRun = false): Promise<RawGig[]> {
+async function scrapeAllGigs(songkickId: string, songkickSlug: string, dryRun = false): Promise<RawGig[]> {
   const allGigs: RawGig[] = [];
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    // per_page_count=50 maximises events returned per request
-    const url = `https://www.songkick.com/artists/${songkickId}/gigography?page=${page}&per_page_count=50`;
+    // Must use {id}-{slug} format. ID-only URLs trigger Songkick's geolocation
+    // redirect which returns local venue listings instead of the artist's gigography.
+    // per_page_count is not a valid param and also causes redirects — omit it.
+    const url = `https://www.songkick.com/artists/${songkickId}-${songkickSlug}/gigography?page=${page}`;
     console.log(`  Page ${page}: fetching…`);
 
     let html: string;
@@ -222,10 +224,10 @@ async function upsertGigs(
 async function processSingleArtist(slug: string, dryRun: boolean) {
   const sb = getSupabase();
 
-  // Look up artist
+  // Look up artist — also fetch slug so we can build the correct Songkick URL
   const { data: artist, error } = await sb
     .from("artists")
-    .select("id, name, songkick_id")
+    .select("id, name, slug, songkick_id")
     .eq("slug", slug)
     .single();
 
@@ -236,12 +238,14 @@ async function processSingleArtist(slug: string, dryRun: boolean) {
 
   console.log(`\n▶ ${artist.name}${dryRun ? " [DRY RUN — no DB writes]" : ""}`);
 
-  // Resolve Songkick ID (cached on artists.songkick_id)
+  // Resolve Songkick ID + slug.
+  // When cached we only stored the numeric ID, so fall back to the artist's own
+  // DB slug as the Songkick URL slug (they match for the vast majority of artists).
   let songkickInfo: { id: string; slug: string } | null = null;
 
   if (artist.songkick_id) {
     console.log(`  Using cached Songkick ID: ${artist.songkick_id}`);
-    songkickInfo = { id: artist.songkick_id, slug: "" };
+    songkickInfo = { id: artist.songkick_id, slug: artist.slug };
   } else {
     console.log(`  Searching Songkick for "${artist.name}"...`);
     await sleep(RATE_LIMIT_MS);
@@ -258,8 +262,10 @@ async function processSingleArtist(slug: string, dryRun: boolean) {
     }
   }
 
-  // Scrape all gig pages — pass dryRun so it stops after page 1 for quick tests
-  const gigs = await scrapeAllGigs(songkickInfo.id, dryRun);
+  console.log(`  Songkick URL slug: ${songkickInfo.slug}`);
+
+  // Scrape all gig pages — pass both id and slug so URL is {id}-{slug}/gigography
+  const gigs = await scrapeAllGigs(songkickInfo.id, songkickInfo.slug, dryRun);
   console.log(`\n  Total scraped: ${gigs.length} gigs`);
 
   if (gigs.length === 0) {
