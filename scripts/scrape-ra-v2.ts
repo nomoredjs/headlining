@@ -20,8 +20,9 @@
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts dom-dolla
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --all
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --dry-run dom-dolla
- *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --debug dom-dolla   ← dumps raw GQL response
- *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --reset-id dom-dolla ← clears bad cached ID
+ *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --debug dom-dolla          ← dumps raw GQL response
+ *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --reset-id dom-dolla       ← clears bad cached ID
+ *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --ra-id=91935 dom-dolla    ← bypass ID resolution
  */
 
 import { getSupabase } from "./lib/supabase.js";
@@ -86,32 +87,63 @@ async function postGraphql(body: object): Promise<unknown> {
   return json;
 }
 
-// ─── Step 1: resolve numeric RA ID from __NEXT_DATA__ ─────────────────────────
-// RA uses Apollo Client. Every cached object is stored under the key
-// "TypeName:id" — so the artist's entry will appear as "Artist:91935"
-// in the raw JSON text. We search for that pattern specifically, which is
-// far more reliable than walking the whole tree and guessing by frequency.
+// ─── Step 1: resolve numeric RA ID ────────────────────────────────────────────
+//
+// Strategy A (primary): RA GraphQL — query artist profile by urlName (slug).
+//   RA's GraphQL endpoint already works (we use it for events). This avoids
+//   the HTTP 403 that RA's bot-protection returns on HTML page fetches.
+//
+// Strategy B (fallback): HTML __NEXT_DATA__ scrape of https://ra.co/dj/{slug}
+//   Kept as fallback in case the GraphQL schema changes.
 
-async function resolveRaId(slug: string): Promise<string | null> {
+async function resolveRaIdViaGraphql(slug: string): Promise<string | null> {
+  console.log(`  Trying GraphQL artist lookup for slug="${slug}"`);
+  try {
+    const body = {
+      operationName: "GET_ARTIST_PROFILE",
+      variables: { slug },
+      query: `
+        query GET_ARTIST_PROFILE($slug: String!) {
+          artist(slug: $slug) {
+            id
+            name
+            urlName
+          }
+        }
+      `,
+    };
+    const json = (await postGraphql(body)) as Record<string, unknown>;
+    const artist = (json?.data as Record<string, unknown>)?.artist as Record<string, unknown> | null;
+    const id = artist?.id;
+    if (typeof id === "number" || (typeof id === "string" && /^\d{4,7}$/.test(String(id)))) {
+      console.log(`  Found RA ID via GraphQL: ${id}  (name=${artist?.name})`);
+      return String(id);
+    }
+    if (DEBUG) console.log("  GraphQL response:", JSON.stringify(json, null, 2).slice(0, 500));
+  } catch (err) {
+    console.log(`  GraphQL lookup failed: ${(err as Error).message}`);
+  }
+  return null;
+}
+
+async function resolveRaIdViaHtml(slug: string): Promise<string | null> {
   const url  = `https://ra.co/dj/${slug}`;
-  console.log(`  Resolving RA ID from ${url}`);
+  console.log(`  Trying HTML scrape: ${url}`);
   const html = await fetchHtml(url);
   if (!html) return null;
 
-  // Extract raw __NEXT_DATA__ text without parsing — regex search is faster
-  // and avoids ambiguity from generic "id" fields elsewhere in the tree.
   const scriptMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   const raw = scriptMatch?.[1] ?? "";
   if (!raw) { console.log("  __NEXT_DATA__ not found"); return null; }
 
-  // Strategy 1: Apollo cache key  "Artist:91935"
+  // Apollo cache key  "Artist:91935"
   const apollo = raw.match(/"Artist:(\d{4,7})"/);
   if (apollo) {
     console.log(`  Found RA ID via Apollo cache key "Artist:${apollo[1]}"`);
     return apollo[1];
   }
 
-  // Strategy 2: __typename / id pair (order-independent)
+  // __typename / id pair (order-independent)
   const pair =
     raw.match(/"__typename"\s*:\s*"Artist"[^}]{0,300}"id"\s*:\s*"(\d{4,7})"/) ??
     raw.match(/"id"\s*:\s*"(\d{4,7})"[^}]{0,300}"__typename"\s*:\s*"Artist"/);
@@ -120,7 +152,7 @@ async function resolveRaId(slug: string): Promise<string | null> {
     return pair[1];
   }
 
-  // Strategy 3: pageProps.data.artist.id (SSR props direct path)
+  // pageProps.data.artist.id (SSR props direct path)
   try {
     const nd  = JSON.parse(raw) as Record<string, unknown>;
     const pp  = (nd?.props as Record<string, unknown>)?.pageProps as Record<string, unknown>;
@@ -136,6 +168,16 @@ async function resolveRaId(slug: string): Promise<string | null> {
   console.log("  Could not extract RA ID from __NEXT_DATA__");
   if (DEBUG) console.log("  Raw snippet (first 800 chars):\n", raw.slice(0, 800));
   return null;
+}
+
+async function resolveRaId(slug: string): Promise<string | null> {
+  // Strategy A: GraphQL (avoids bot-protection 403 on HTML pages)
+  const gqlId = await resolveRaIdViaGraphql(slug);
+  if (gqlId) return gqlId;
+
+  // Strategy B: HTML scrape fallback
+  await sleep(RATE_LIMIT_MS);
+  return resolveRaIdViaHtml(slug);
 }
 
 // ─── Step 2: GraphQL pagination ───────────────────────────────────────────────
@@ -294,7 +336,7 @@ async function upsertGigs(
 
 // ─── Process one artist ───────────────────────────────────────────────────────
 
-async function processArtist(slug: string, dryRun: boolean, resetId: boolean) {
+async function processArtist(slug: string, dryRun: boolean, resetId: boolean, manualRaId?: string) {
   const sb = getSupabase();
 
   const { data: artist, error } = await sb
@@ -317,19 +359,22 @@ async function processArtist(slug: string, dryRun: boolean, resetId: boolean) {
     console.warn(`  ⚠ Corrupted ra_id in DB: "${cachedId}" — will re-resolve`);
   }
 
-  let raId = (!resetId && isValidId) ? cachedId : "";
+  // --ra-id=XXXXX flag takes highest priority
+  let raId = manualRaId ?? ((!resetId && isValidId) ? cachedId : "");
 
-  if (!raId) {
+  if (manualRaId) {
+    console.log(`  Using manually supplied ra_id=${raId}`);
+  } else if (!raId) {
     await sleep(RATE_LIMIT_MS);
     raId = (await resolveRaId(raSlug)) ?? "";
     if (!raId) { console.error("  Could not resolve RA ID — skipping"); return; }
-
-    if (!dryRun) {
-      await sb.from("artists").update({ ra_id: raId }).eq("id", artist.id);
-      console.log(`  Cached ra_id=${raId} in DB`);
-    }
   } else {
     console.log(`  Using cached ra_id=${raId}`);
+  }
+
+  if (raId && !dryRun && raId !== cachedId) {
+    await sb.from("artists").update({ ra_id: raId }).eq("id", artist.id);
+    console.log(`  Cached ra_id=${raId} in DB`);
   }
 
   // ── Step 2: fetch all events via GraphQL ───────────────────────────────────
@@ -360,10 +405,12 @@ async function main() {
   const dryRun   = args.includes("--dry-run");
   const resetId  = args.includes("--reset-id");
   DEBUG          = args.includes("--debug");
+  const raIdArg  = args.find(a => a.startsWith("--ra-id="))?.split("=")[1];
   const targets  = args.filter(a => !a.startsWith("--"));
 
   if (!targets.length) {
-    console.error("Usage: scrape-ra-v2.ts [--dry-run] [--debug] [--reset-id] <slug|--all>");
+    console.error("Usage: scrape-ra-v2.ts [--dry-run] [--debug] [--reset-id] [--ra-id=XXXXX] <slug|--all>");
+    console.error("  --ra-id=XXXXX  bypass ID resolution and use this numeric RA artist ID");
     process.exit(1);
   }
 
@@ -376,7 +423,7 @@ async function main() {
       await sleep(RATE_LIMIT_MS);
     }
   } else {
-    await processArtist(targets[0], dryRun, resetId);
+    await processArtist(targets[0], dryRun, resetId, raIdArg);
   }
 
   console.log("\nDone.");
