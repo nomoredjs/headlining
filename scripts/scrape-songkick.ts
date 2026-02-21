@@ -133,8 +133,9 @@ async function scrapeAllGigs(songkickId: string, dryRun = false): Promise<RawGig
   const allGigs: RawGig[] = [];
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const url = `https://www.songkick.com/artists/${songkickId}/gigography?page=${page}`;
-    console.log(`  Page ${page}: ${url}`);
+    // per_page_count=50 maximises events returned per request
+    const url = `https://www.songkick.com/artists/${songkickId}/gigography?page=${page}&per_page_count=50`;
+    console.log(`  Page ${page}: fetching…`);
 
     let html: string;
     try {
@@ -145,11 +146,19 @@ async function scrapeAllGigs(songkickId: string, dryRun = false): Promise<RawGig
     }
 
     const gigs = parseGigPage(html);
-    console.log(`    → ${gigs.length} events (${allGigs.length + gigs.length} total)`);
+    console.log(`  Page ${page}: ${gigs.length} events (total ${allGigs.length + gigs.length})`);
 
-    // Primary stop: empty page means we've gone past the last page.
     if (gigs.length === 0) {
-      console.log(`  Page ${page} returned 0 events — done.`);
+      // Print a raw HTML snippet so we can diagnose blocks / sign-in walls / selector drift
+      const snippet = html
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 400);
+      console.log(`  Page ${page} returned 0 events — stopping.`);
+      console.log(`  HTML preview: ${snippet}`);
       break;
     }
 
