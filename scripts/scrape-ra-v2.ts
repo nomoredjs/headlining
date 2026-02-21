@@ -1,16 +1,14 @@
 /**
- * Resident Advisor gig scraper — SECONDARY source.
- * Adds co-artist lineup data that Songkick doesn't have.
+ * Resident Advisor gig scraper — PRIMARY gig source.
+ *
+ * Uses RA's public GraphQL endpoint (no auth required).
+ * RA is the authoritative source for electronic music gigs and
+ * has co-artist lineup data that no other source provides.
  *
  * Usage:
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts dom-dolla
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --all
- *
- * Strategy:
- *  1. Resolve RA numeric artist ID from __NEXT_DATA__ on ra.co/dj/{slug}
- *  2. Query RA GraphQL (public, no auth) for all past events
- *  3. Upsert gigs; if same artist+date+city already exists from Songkick,
- *     UPDATE co_artists only — don't create a duplicate row.
+ *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --dry-run dom-dolla
  */
 
 import * as cheerio from "cheerio";
@@ -18,8 +16,9 @@ import { getSupabase } from "./lib/supabase.js";
 import { inferGigType } from "./lib/gig-utils.js";
 
 const RATE_LIMIT_MS = 2000;
-const RA_GRAPHQL    = "https://ra.co/graphql";
-const RA_PAGE_SIZE  = 100; // events per GraphQL page
+const RA_GRAPHQL   = "https://ra.co/graphql";
+const PAGE_SIZE    = 100;
+const MAX_PAGES    = 50; // 50 × 100 = 5 000 events max
 
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
@@ -28,40 +27,64 @@ const UA =
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── RA artist ID resolution ───────────────────────────────────────────────────
+// RA embeds all page data in a __NEXT_DATA__ script tag. We parse it to find
+// the numeric artist ID, which is required for GraphQL queries.
 
-async function resolveRaId(artistName: string): Promise<string | null> {
-  // Build slug candidates
-  const slug = artistName
+async function resolveRaId(artistName: string, dbSlug: string): Promise<{ raId: string; raSlug: string } | null> {
+  // Build slug candidates from artist name + their DB slug
+  const nameDerived = artistName
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, "")
     .trim()
     .replace(/\s+/g, "-");
 
-  const candidates = [slug, slug.replace(/-/g, "")];
+  const candidates = [...new Set([dbSlug, nameDerived, nameDerived.replace(/-/g, "")])]
+    .filter(Boolean);
 
   for (const candidate of candidates) {
     const url = `https://ra.co/dj/${candidate}`;
+    console.log(`  Trying RA slug: ${url}`);
+
     try {
       const res = await fetch(url, {
-        headers: { "User-Agent": UA, Accept: "text/html" },
+        headers: { "User-Agent": UA, Accept: "text/html", "Accept-Language": "en-US,en;q=0.9" },
       });
-      if (!res.ok) continue;
+      if (!res.ok) { console.log(`    HTTP ${res.status}`); continue; }
 
       const html = await res.text();
-
-      // RA embeds all data in __NEXT_DATA__ script tag
       const $ = cheerio.load(html);
-      const nextDataJson = $("#__NEXT_DATA__").html();
-      if (!nextDataJson) continue;
+      const nextDataRaw = $("#__NEXT_DATA__").html();
+      if (!nextDataRaw) { console.log("    No __NEXT_DATA__ found"); continue; }
 
-      const nextData = JSON.parse(nextDataJson) as {
-        props?: { pageProps?: { artist?: { id?: string } } };
-      };
-      const id = nextData?.props?.pageProps?.artist?.id;
-      if (id) return String(id);
-    } catch {
-      // try next candidate
+      // RA's __NEXT_DATA__ structure has changed over time — try multiple paths
+      const nd = JSON.parse(nextDataRaw) as Record<string, unknown>;
+      const artist =
+        (nd?.props as Record<string, unknown>)?.pageProps as Record<string, unknown> | undefined;
+
+      // Try multiple known RA __NEXT_DATA__ shapes
+      const id =
+        (artist?.artist as Record<string, unknown>)?.id ??
+        (artist?.data as Record<string, unknown>)?.id ??
+        (artist?.dj as Record<string, unknown>)?.id;
+
+      if (id) {
+        console.log(`  Found RA ID: ${id} (slug: ${candidate})`);
+        return { raId: String(id), raSlug: candidate };
+      }
+
+      // Fallback: scan the full JSON for any "id" near "artist"
+      const raw = nextDataRaw;
+      const match = raw.match(/"artist"\s*:\s*\{[^}]*"id"\s*:\s*"?(\d+)"?/);
+      if (match) {
+        console.log(`  Found RA ID via regex: ${match[1]} (slug: ${candidate})`);
+        return { raId: match[1], raSlug: candidate };
+      }
+
+      console.log(`    __NEXT_DATA__ found but no artist ID`);
+    } catch (err) {
+      console.log(`    Error: ${(err as Error).message}`);
     }
+
     await sleep(RATE_LIMIT_MS);
   }
 
@@ -72,226 +95,288 @@ async function resolveRaId(artistName: string): Promise<string | null> {
 
 interface RaEvent {
   id: string;
-  listingDate: string;           // "2025-07-25T22:00:00.000Z"
-  event: {
-    title: string;
-    venue: {
-      name: string;
-      area: { name: string; country: { name: string } };
-    } | null;
-    artists: Array<{ name: string }>;
-  } | null;
+  date: string;       // "2025-07-25" or ISO timestamp
+  startTime?: string;
+  title: string;
+  venue: { name: string; area: { name: string; country: { name: string } } } | null;
+  artists: Array<{ name: string }>;
 }
 
-async function fetchRaEvents(raId: string): Promise<RaEvent[]> {
-  const allEvents: RaEvent[] = [];
-  let offset = 0;
-
-  while (true) {
-    const body = {
+// RA has changed their GraphQL schema. We try two known query shapes.
+const QUERIES = [
+  // Shape A — newer RA schema (listing root query)
+  {
+    operationName: "GET_DEFAULT_EVENTS_LISTING",
+    buildBody: (raId: string, page: number) => ({
       operationName: "GET_DEFAULT_EVENTS_LISTING",
       variables: {
-        filter: {
-          artist: { id: raId },
-          // Fetch historical gigs (lt = less than NOW means past events)
-          listingDate: { lt: new Date().toISOString() },
-        },
-        pageSize: RA_PAGE_SIZE,
-        page: Math.floor(offset / RA_PAGE_SIZE) + 1,
+        filters: { artists: { ids: [raId] } },
+        pageSize: PAGE_SIZE,
+        page,
       },
       query: `
-        query GET_DEFAULT_EVENTS_LISTING($filter: FilterInputDtoInput, $pageSize: Int, $page: Int) {
-          listing(filter: $filter, pageSize: $pageSize, page: $page) {
+        query GET_DEFAULT_EVENTS_LISTING($filters: FilterQuery, $pageSize: Int, $page: Int) {
+          listing(filters: $filters, pageSize: $pageSize, page: $page) {
+            totalResults
             data {
               id
-              listingDate
-              event {
-                title
-                venue {
-                  name
-                  area {
-                    name
-                    country { name }
-                  }
-                }
-                artists { name }
-              }
+              date
+              startTime
+              title
+              venue { name area { name country { name } } }
+              artists { name }
             }
-            totalResults
           }
         }
       `,
-    };
+    }),
+    extract: (json: Record<string, unknown>) => {
+      const l = (json?.data as Record<string, unknown>)?.listing as
+        { data: RaEvent[]; totalResults: number } | undefined;
+      return l ? { events: l.data, total: l.totalResults } : null;
+    },
+  },
 
-    const res = await fetch(RA_GRAPHQL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        Referer: "https://ra.co/",
-        Origin: "https://ra.co",
-      },
-      body: JSON.stringify(body),
-    });
+  // Shape B — older RA schema (artist.eventListings)
+  {
+    operationName: "GET_ARTIST_EVENTS",
+    buildBody: (raId: string, page: number) => ({
+      operationName: "GET_ARTIST_EVENTS",
+      variables: { id: raId, pageSize: PAGE_SIZE, page },
+      query: `
+        query GET_ARTIST_EVENTS($id: ID!, $pageSize: Int, $page: Int) {
+          artist(id: $id) {
+            eventListings(pageSize: $pageSize, page: $page) {
+              totalResults
+              data {
+                id
+                startTime
+                event {
+                  id
+                  title
+                  date
+                  venue { name area { name country { name } } }
+                  artists { name }
+                }
+              }
+            }
+          }
+        }
+      `,
+    }),
+    extract: (json: Record<string, unknown>) => {
+      const artist = (json?.data as Record<string, unknown>)?.artist as Record<string, unknown> | undefined;
+      const el = artist?.eventListings as { data: Array<{ startTime: string; event: RaEvent }>; totalResults: number } | undefined;
+      if (!el?.data?.length) return null;
+      const events = el.data
+        .filter(d => d.event)
+        .map(d => ({ ...d.event, date: d.event.date ?? d.startTime?.slice(0, 10) }));
+      return { events, total: el.totalResults };
+    },
+  },
+];
 
-    if (!res.ok) {
-      console.warn(`  RA GraphQL HTTP ${res.status}`);
+async function fetchRaEvents(raId: string): Promise<RaEvent[]> {
+  const allEvents: RaEvent[] = [];
+
+  // Try each query shape — use whichever works first and stick with it
+  let workingQueryIdx = -1;
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    let fetched = false;
+
+    const indicesToTry = workingQueryIdx >= 0 ? [workingQueryIdx] : QUERIES.map((_, i) => i);
+
+    for (const qi of indicesToTry) {
+      const q = QUERIES[qi];
+      const body = q.buildBody(raId, page);
+
+      let res: Response;
+      try {
+        res = await fetch(RA_GRAPHQL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+            Referer: "https://ra.co/",
+            Origin: "https://ra.co",
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        console.warn(`  RA GraphQL network error:`, (err as Error).message);
+        break;
+      }
+
+      if (!res.ok) {
+        console.warn(`  RA GraphQL HTTP ${res.status} (query shape ${qi + 1})`);
+        continue;
+      }
+
+      const json = await res.json() as Record<string, unknown>;
+
+      if ((json.errors as unknown[])?.length) {
+        console.warn(`  GraphQL errors (shape ${qi + 1}):`,
+          (json.errors as Array<{ message: string }>).map(e => e.message).join(", "));
+        continue;
+      }
+
+      const result = q.extract(json);
+      if (!result || !result.events.length) {
+        // Could be valid empty result on page 2+ — fall through
+        if (page === 1) {
+          console.log(`  Query shape ${qi + 1} returned no events on page 1`);
+          continue;
+        }
+        // No more pages
+        console.log(`  Page ${page}: 0 events — done.`);
+        return allEvents;
+      }
+
+      workingQueryIdx = qi;
+      allEvents.push(...result.events);
+      console.log(`  Page ${page}: ${result.events.length} events (${allEvents.length}/${result.total} total) [shape ${qi + 1}]`);
+
+      fetched = true;
+      if (allEvents.length >= result.total) {
+        console.log(`  Fetched all ${allEvents.length} events.`);
+        return allEvents;
+      }
+      break; // move to next page
+    }
+
+    if (!fetched) {
+      if (page === 1) {
+        console.warn("  All query shapes failed on page 1 — no RA data");
+        return [];
+      }
       break;
     }
 
-    const json = (await res.json()) as {
-      data?: { listing?: { data: RaEvent[]; totalResults: number } };
-      errors?: Array<{ message: string }>;
-    };
-
-    if (json.errors?.length) {
-      console.warn("  RA GraphQL errors:", json.errors.map(e => e.message).join(", "));
-      break;
-    }
-
-    const listing = json.data?.listing;
-    if (!listing?.data?.length) break;
-
-    allEvents.push(...listing.data);
-    console.log(`  RA page ${Math.floor(offset / RA_PAGE_SIZE) + 1}: ${listing.data.length} events (${allEvents.length}/${listing.totalResults} total)`);
-
-    if (allEvents.length >= listing.totalResults) break;
-    offset += RA_PAGE_SIZE;
     await sleep(RATE_LIMIT_MS);
   }
 
   return allEvents;
 }
 
-// ── Upsert gigs, merge co_artists onto existing Songkick rows ─────────────────
+// ── Upsert gigs (batched) ─────────────────────────────────────────────────────
+
+const BATCH = 100;
 
 async function upsertRaGigs(
   artistId: string,
   events: RaEvent[],
   artistName: string,
-): Promise<{ upserted: number; merged: number; errors: number }> {
+): Promise<{ inserted: number; errors: number }> {
   const sb = getSupabase();
-  let upserted = 0;
-  let merged   = 0;
+  let inserted = 0;
   let errors   = 0;
 
-  for (const ev of events) {
-    if (!ev.event) continue;
+  const rows = events
+    .filter(ev => ev.venue || ev.title)
+    .map(ev => {
+      const coArtists = (ev.artists ?? [])
+        .map(a => a.name)
+        .filter(n => n.toLowerCase() !== artistName.toLowerCase());
 
-    const date = ev.listingDate.slice(0, 10);
-    const venue = ev.event.venue;
-    const venueName   = venue?.name ?? "";
-    const venueCity   = venue?.area?.name ?? "";
-    const venueCountry = venue?.area?.country?.name ?? "";
-    const eventName   = ev.event.title ?? "";
-    const gigType     = inferGigType(eventName, venueName);
+      const date = (ev.date ?? ev.startTime ?? "").slice(0, 10);
 
-    // Co-artists = everyone on the lineup except our target artist
-    const coArtists = ev.event.artists
-      .map(a => a.name)
-      .filter(n => n.toLowerCase() !== artistName.toLowerCase());
+      return {
+        artist_id:     artistId,
+        date,
+        venue_name:    ev.venue?.name || ev.title,
+        venue_city:    ev.venue?.area?.name ?? "",
+        venue_country: ev.venue?.area?.country?.name ?? "",
+        event_name:    ev.title ?? "",
+        gig_type:      inferGigType(ev.title ?? "", ev.venue?.name ?? ""),
+        co_artists:    coArtists,
+        source:        "ra",
+      };
+    })
+    .filter(r => r.date && r.venue_name);
 
-    // Check if a gig already exists from Songkick for this artist+date+city
-    const { data: existing } = await sb
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const { error, count } = await sb
       .from("gigs")
-      .select("id, co_artists")
-      .eq("artist_id", artistId)
-      .eq("date", date)
-      .ilike("venue_city", `%${venueCity.slice(0, 8)}%`)
-      .maybeSingle();
+      .upsert(batch, { onConflict: "artist_id,date,venue_name", ignoreDuplicates: false })
+      .select("id", { count: "exact", head: true });
 
-    if (existing) {
-      // Merge co_artists — union of existing + new
-      const merged_list = [...new Set([...(existing.co_artists ?? []), ...coArtists])];
-      const { error } = await sb
-        .from("gigs")
-        .update({ co_artists: merged_list, source: "songkick+ra" })
-        .eq("id", existing.id);
-      if (error) errors++;
-      else merged++;
-    } else {
-      // Insert new gig from RA
-      const { error } = await sb.from("gigs").upsert(
-        {
-          artist_id: artistId,
-          date,
-          venue_name: venueName || eventName,
-          venue_city: venueCity,
-          venue_country: venueCountry,
-          event_name: eventName,
-          gig_type: gigType,
-          co_artists: coArtists,
-          source: "ra",
-        },
-        { onConflict: "artist_id,date,venue_name", ignoreDuplicates: false }
-      );
-      if (error) errors++;
-      else upserted++;
-    }
+    if (error) { console.warn(`  Batch error:`, error.message); errors += batch.length; }
+    else inserted += count ?? batch.length;
   }
 
-  return { upserted, merged, errors };
+  return { inserted, errors };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-async function processSingleArtist(slug: string) {
+async function processArtist(slug: string, dryRun: boolean) {
   const sb = getSupabase();
 
   const { data: artist, error } = await sb
     .from("artists")
-    .select("id, name, ra_id")
+    .select("id, name, slug, ra_id")
     .eq("slug", slug)
     .single();
 
-  if (error || !artist) {
-    console.error(`Artist not found in DB: ${slug}`);
-    return;
-  }
+  if (error || !artist) { console.error(`Artist not found: ${slug}`); return; }
 
-  console.log(`\n▶ ${artist.name}`);
+  console.log(`\n▶ ${artist.name}${dryRun ? " [DRY RUN]" : ""}`);
 
   let raId = artist.ra_id ?? null;
+  let raSlug = slug;
 
   if (!raId) {
-    console.log(`  Resolving RA ID for "${artist.name}"...`);
-    raId = await resolveRaId(artist.name);
-    if (!raId) {
-      console.error(`  ✗ Could not resolve RA ID — skipping`);
-      return;
-    }
-    console.log(`  Found RA ID: ${raId}`);
-    await sb.from("artists").update({ ra_id: raId }).eq("id", artist.id);
+    console.log(`  Resolving RA ID...`);
+    const resolved = await resolveRaId(artist.name, slug);
+    if (!resolved) { console.error(`  ✗ Could not resolve RA ID`); return; }
+    raId = resolved.raId;
+    raSlug = resolved.raSlug;
+    if (!dryRun) await sb.from("artists").update({ ra_id: raId }).eq("id", artist.id);
   } else {
     console.log(`  Using cached RA ID: ${raId}`);
   }
 
   const events = await fetchRaEvents(raId);
-  console.log(`  Total RA events: ${events.length}`);
+  console.log(`\n  Total: ${events.length} RA events`);
 
   if (!events.length) return;
 
-  const { upserted, merged, errors } = await upsertRaGigs(artist.id, events, artist.name);
-  console.log(`  ✅ ${upserted} new gigs, ${merged} co_artist merges, ${errors} errors`);
+  // Show sample
+  const sample = events.slice(0, 3);
+  for (const ev of sample) {
+    const city = ev.venue?.area?.name ?? "?";
+    const country = ev.venue?.area?.country?.name ?? "";
+    console.log(`    ${ev.date?.slice(0, 10)}  ${ev.venue?.name ?? ev.title}  — ${city}, ${country}`);
+  }
+  if (events.length > 3) console.log(`    ... and ${events.length - 3} more`);
+
+  if (dryRun) { console.log("\n  [dry-run] skipping DB write"); return; }
+
+  const { inserted, errors } = await upsertRaGigs(artist.id, events, artist.name);
+  console.log(`\n  ✅ ${inserted} inserted/updated, ${errors} errors`);
 }
 
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length) {
-    console.error("Usage: scrape-ra-v2.ts <slug>  OR  --all");
+    console.error("Usage: scrape-ra-v2.ts [--dry-run] <slug|--all>");
     process.exit(1);
   }
 
+  const dryRun  = args.includes("--dry-run");
+  const targets = args.filter(a => a !== "--dry-run");
   const sb = getSupabase();
 
-  if (args[0] === "--all") {
+  if (targets[0] === "--all") {
     const { data: artists } = await sb.from("artists").select("slug").order("name");
     for (const a of artists ?? []) {
-      await processSingleArtist(a.slug);
+      await processArtist(a.slug, dryRun);
       await sleep(RATE_LIMIT_MS);
     }
   } else {
-    await processSingleArtist(args[0]);
+    await processArtist(targets[0], dryRun);
   }
 
   console.log("\nDone.");

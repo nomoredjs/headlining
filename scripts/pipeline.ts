@@ -107,8 +107,8 @@ async function main() {
   console.log(`${"═".repeat(50)}\n`);
 
   const steps: Array<{ name: string; script: string }> = [
-    { name: "1. Songkick gigs (primary)",           script: "scrape-songkick" },
-    { name: "2. RA gigs + co-artists (secondary)",  script: "scrape-ra-v2" },
+    { name: "1. RA gigs + co-artists (primary)",    script: "scrape-ra-v2" },
+    { name: "2. Concert Archives (historical fill)", script: "scrape-concert-archives" },
     { name: "3. Geocode backfill",                  script: "backfill-geocode" },
     { name: "4. Artist metadata (Wikipedia/kworb)", script: "scrape-artist-meta" },
     { name: "5. Releases (Wikipedia/Beatport)",     script: "scrape-releases" },
