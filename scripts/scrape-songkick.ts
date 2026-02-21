@@ -126,8 +126,10 @@ function parseGigPage(html: string): RawGig[] {
 }
 
 // ── Paginate through all gigography pages ─────────────────────────────────────
+// Stop condition: a page returns 0 events.  Never rely on page-count guesses
+// because Songkick's page size isn't always 50 and its next-link markup varies.
 
-async function scrapeAllGigs(songkickId: string): Promise<RawGig[]> {
+async function scrapeAllGigs(songkickId: string, dryRun = false): Promise<RawGig[]> {
   const allGigs: RawGig[] = [];
 
   for (let page = 1; page <= MAX_PAGES; page++) {
@@ -143,24 +145,18 @@ async function scrapeAllGigs(songkickId: string): Promise<RawGig[]> {
     }
 
     const gigs = parseGigPage(html);
+    console.log(`    → ${gigs.length} events (${allGigs.length + gigs.length} total)`);
+
+    // Primary stop: empty page means we've gone past the last page.
+    if (gigs.length === 0) {
+      console.log(`  Page ${page} returned 0 events — done.`);
+      break;
+    }
+
     allGigs.push(...gigs);
-    console.log(`    → ${gigs.length} gigs (${allGigs.length} total so far)`);
 
-    // Determine whether there's a next page.
-    // Songkick shows a rel=next link when more pages exist.
-    // Fall back to: if we got a full page (≥ EVENTS_PER_PAGE), keep going.
-    const $ = cheerio.load(html);
-    const hasNextLink =
-      $("a[rel='next']").length > 0 ||
-      $(".pagination a").filter((_, el) => {
-        const href = $(el).attr("href") ?? "";
-        return href.includes(`page=${page + 1}`);
-      }).length > 0;
-
-    const likelyMorePages = gigs.length >= EVENTS_PER_PAGE;
-
-    if (!hasNextLink && !likelyMorePages) {
-      console.log(`  No next page detected — done.`);
+    if (dryRun) {
+      console.log("  [dry-run] stopping after first page");
       break;
     }
 
@@ -215,7 +211,7 @@ async function upsertGigs(
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-async function processSingleArtist(slug: string) {
+async function processSingleArtist(slug: string, dryRun: boolean) {
   const sb = getSupabase();
 
   // Look up artist
@@ -230,7 +226,7 @@ async function processSingleArtist(slug: string) {
     return;
   }
 
-  console.log(`\n▶ ${artist.name}`);
+  console.log(`\n▶ ${artist.name}${dryRun ? " [DRY RUN — no DB writes]" : ""}`);
 
   // Resolve Songkick ID (cached on artists.songkick_id)
   let songkickInfo: { id: string; slug: string } | null = null;
@@ -249,13 +245,14 @@ async function processSingleArtist(slug: string) {
     }
     console.log(`  Found: ID ${songkickInfo.id} (slug: ${songkickInfo.slug})`);
 
-    // Cache the ID
-    await sb.from("artists").update({ songkick_id: songkickInfo.id }).eq("id", artist.id);
+    if (!dryRun) {
+      await sb.from("artists").update({ songkick_id: songkickInfo.id }).eq("id", artist.id);
+    }
   }
 
-  // Scrape all gig pages
-  const gigs = await scrapeAllGigs(songkickInfo.id);
-  console.log(`  Scraped ${gigs.length} raw gigs`);
+  // Scrape all gig pages — pass dryRun so it stops after page 1 for quick tests
+  const gigs = await scrapeAllGigs(songkickInfo.id, dryRun);
+  console.log(`\n  Total scraped: ${gigs.length} gigs`);
 
   if (gigs.length === 0) {
     console.log("  No gigs found — check the Songkick ID or page structure");
@@ -268,7 +265,12 @@ async function processSingleArtist(slug: string) {
     const type = inferGigType(g.eventName, g.venueName);
     console.log(`    ${g.date}  [${type.padEnd(8)}]  ${g.venueName || g.eventName}  — ${g.venueCity}, ${g.venueCountry}`);
   }
-  console.log(`    ... and ${Math.max(0, gigs.length - 5)} more`);
+  if (gigs.length > 5) console.log(`    ... and ${gigs.length - 5} more`);
+
+  if (dryRun) {
+    console.log("\n  [dry-run] skipping DB upsert");
+    return;
+  }
 
   // Upsert
   const { inserted, errors } = await upsertGigs(artist.id, gigs);
@@ -278,19 +280,22 @@ async function processSingleArtist(slug: string) {
 async function main() {
   const args = process.argv.slice(2);
   if (args.length === 0) {
-    console.error("Usage: scrape-songkick.ts <slug>  OR  --all");
+    console.error("Usage: scrape-songkick.ts [--dry-run] <slug|--all>");
     process.exit(1);
   }
 
-  if (args[0] === "--all") {
+  const dryRun = args.includes("--dry-run");
+  const targets = args.filter(a => a !== "--dry-run");
+
+  if (targets[0] === "--all") {
     const sb = getSupabase();
     const { data: artists } = await sb.from("artists").select("slug").order("name");
     for (const a of artists ?? []) {
-      await processSingleArtist(a.slug);
+      await processSingleArtist(a.slug, dryRun);
       await sleep(RATE_LIMIT_MS);
     }
   } else {
-    await processSingleArtist(args[0]);
+    await processSingleArtist(targets[0], dryRun);
   }
 
   console.log("\nDone.");
