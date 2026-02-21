@@ -13,9 +13,8 @@ import * as cheerio from "cheerio";
 import { getSupabase } from "./lib/supabase.js";
 import { inferGigType } from "./lib/gig-utils.js";
 
-const RATE_LIMIT_MS = 2000;   // 2 s between requests
-const EVENTS_PER_PAGE = 50;   // Songkick shows up to 50 events per page
-const MAX_PAGES = 200;         // safety cap (200 × 50 = 10 000 gigs)
+const RATE_LIMIT_MS = 2000;  // 2 s between requests
+const MAX_PAGES      = 200;  // safety cap
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
