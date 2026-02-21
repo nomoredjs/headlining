@@ -165,7 +165,7 @@ async function resolveRaId(slug: string, artistName: string): Promise<string | n
 
 interface RaGqlEvent {
   id: string;
-  date: string;
+  startTime: string;
   title: string;
   venue: { name: string; area: { name: string; country: { name: string } } };
   artists: Array<{ name: string }>;
@@ -198,6 +198,10 @@ async function fetchEventsPage(
       sortField:    direction === "past" ? "EVENTDATE" : "EVENTDATE",
       sortOrder:    direction === "past" ? "DESCENDING" : "ASCENDING",
     },
+    // Types confirmed from RA schema error messages:
+    //   FilterSortField  → FilterSortFieldType
+    //   FilterSortOrder  → FilterSortOrderType
+    // Arguments go directly on listing(...), NOT wrapped in filter: {}
     query: `
       query GET_DEFAULT_EVENTS_LISTING(
         $indices: [IndexType!]!
@@ -206,10 +210,10 @@ async function fetchEventsPage(
         $baseFilters: [FilterInput]
         $pageSize: Int
         $page: Int
-        $sortField: FilterSortField
-        $sortOrder: FilterSortOrder
+        $sortField: FilterSortFieldType
+        $sortOrder: FilterSortOrderType
       ) {
-        listing(filter: {
+        listing(
           indices: $indices
           aggregations: $aggregations
           filters: $filters
@@ -218,11 +222,11 @@ async function fetchEventsPage(
           page: $page
           sortField: $sortField
           sortOrder: $sortOrder
-        }) {
+        ) {
           data {
             ... on Event {
               id
-              date: startTime
+              startTime
               title
               venue { name area { name country { name } } }
               artists { name }
@@ -261,7 +265,7 @@ async function fetchAllEvents(raId: string): Promise<RaGqlEvent[]> {
 // ─── Normalise GQL event → our row shape ─────────────────────────────────────
 
 function normalise(e: RaGqlEvent, targetArtistName: string) {
-  const date         = (e.date ?? "").slice(0, 10);
+  const date         = (e.startTime ?? "").slice(0, 10);
   const venueName    = e.venue?.name ?? "";
   const venueCity    = e.venue?.area?.name ?? "";
   const venueCountry = e.venue?.area?.country?.name ?? "";
