@@ -24,7 +24,6 @@
  *   npx tsx --env-file=.env.local scripts/scrape-ra-v2.ts --reset-id dom-dolla ← clears bad cached ID
  */
 
-import * as cheerio from "cheerio";
 import { getSupabase } from "./lib/supabase.js";
 import { inferGigType } from "./lib/gig-utils.js";
 
@@ -88,76 +87,54 @@ async function postGraphql(body: object): Promise<unknown> {
 }
 
 // ─── Step 1: resolve numeric RA ID from __NEXT_DATA__ ─────────────────────────
-// The artist page embeds all SSR props inside <script id="__NEXT_DATA__">.
-// The numeric ID appears at several paths — we walk the whole tree and collect
-// every "id"-shaped value, then pick the one that appears in artist context.
+// RA uses Apollo Client. Every cached object is stored under the key
+// "TypeName:id" — so the artist's entry will appear as "Artist:91935"
+// in the raw JSON text. We search for that pattern specifically, which is
+// far more reliable than walking the whole tree and guessing by frequency.
 
-async function resolveRaId(slug: string, artistName: string): Promise<string | null> {
+async function resolveRaId(slug: string): Promise<string | null> {
   const url  = `https://ra.co/dj/${slug}`;
   console.log(`  Resolving RA ID from ${url}`);
   const html = await fetchHtml(url);
   if (!html) return null;
 
-  const $ = cheerio.load(html);
-  const raw = $("#__NEXT_DATA__").html() ?? "";
+  // Extract raw __NEXT_DATA__ text without parsing — regex search is faster
+  // and avoids ambiguity from generic "id" fields elsewhere in the tree.
+  const scriptMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  const raw = scriptMatch?.[1] ?? "";
   if (!raw) { console.log("  __NEXT_DATA__ not found"); return null; }
 
-  let nd: Record<string, unknown>;
-  try { nd = JSON.parse(raw); }
-  catch { console.log("  Failed to parse __NEXT_DATA__"); return null; }
+  // Strategy 1: Apollo cache key  "Artist:91935"
+  const apollo = raw.match(/"Artist:(\d{4,7})"/);
+  if (apollo) {
+    console.log(`  Found RA ID via Apollo cache key "Artist:${apollo[1]}"`);
+    return apollo[1];
+  }
 
-  // Walk the tree and collect any numeric values stored under keys named "id"
-  // that are plausible RA artist IDs (4–6 digit integers).
-  const candidates: number[] = [];
+  // Strategy 2: __typename / id pair (order-independent)
+  const pair =
+    raw.match(/"__typename"\s*:\s*"Artist"[^}]{0,300}"id"\s*:\s*"(\d{4,7})"/) ??
+    raw.match(/"id"\s*:\s*"(\d{4,7})"[^}]{0,300}"__typename"\s*:\s*"Artist"/);
+  if (pair) {
+    console.log(`  Found RA ID via __typename+id pair: ${pair[1]}`);
+    return pair[1];
+  }
 
-  function walk(val: unknown, parentKey = ""): void {
-    if (val === null || val === undefined) return;
-    if (typeof val === "number") {
-      if (parentKey === "id" && val > 1000 && val < 9_999_999) candidates.push(val);
-      return;
+  // Strategy 3: pageProps.data.artist.id (SSR props direct path)
+  try {
+    const nd  = JSON.parse(raw) as Record<string, unknown>;
+    const pp  = (nd?.props as Record<string, unknown>)?.pageProps as Record<string, unknown>;
+    const id  =
+      (pp?.data  as Record<string, unknown>)?.artist?.id ??
+      (pp?.artist as Record<string, unknown>)?.id;
+    if (typeof id === "number") {
+      console.log(`  Found RA ID via pageProps.data.artist.id: ${id}`);
+      return String(id);
     }
-    if (typeof val === "string") {
-      if (parentKey === "id" && /^\d{4,7}$/.test(val)) candidates.push(Number(val));
-      return;
-    }
-    if (Array.isArray(val)) { val.forEach(v => walk(v, parentKey)); return; }
-    if (typeof val === "object") {
-      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-        walk(v, k);
-      }
-    }
-  }
+  } catch { /* ignore */ }
 
-  walk(nd);
-
-  if (!candidates.length) {
-    console.log("  No numeric IDs found in __NEXT_DATA__");
-    return null;
-  }
-
-  // The artist's own ID is usually the most-repeated value, or the first one
-  // encountered under props.pageProps.
-  const freq: Record<number, number> = {};
-  for (const n of candidates) freq[n] = (freq[n] ?? 0) + 1;
-
-  // Try the direct path first
-  const pp = (nd as Record<string, unknown>)?.props as Record<string, unknown>;
-  const directId =
-    (pp?.pageProps as Record<string, unknown>)?.data?.artist?.id ??
-    (pp?.pageProps as Record<string, unknown>)?.artist?.id;
-
-  if (directId && typeof directId === "number") {
-    console.log(`  Found RA ID (direct path): ${directId}`);
-    return String(directId);
-  }
-
-  // Fall back: most frequent ID
-  const best = Object.entries(freq).sort((a, b) => b[1] - a[1])[0];
-  if (best) {
-    console.log(`  Found RA ID (most-frequent): ${best[0]}  (seen ${best[1]}×)`);
-    return best[0];
-  }
-
+  console.log("  Could not extract RA ID from __NEXT_DATA__");
+  if (DEBUG) console.log("  Raw snippet (first 800 chars):\n", raw.slice(0, 800));
   return null;
 }
 
@@ -344,7 +321,7 @@ async function processArtist(slug: string, dryRun: boolean, resetId: boolean) {
 
   if (!raId) {
     await sleep(RATE_LIMIT_MS);
-    raId = (await resolveRaId(raSlug, artist.name)) ?? "";
+    raId = (await resolveRaId(raSlug)) ?? "";
     if (!raId) { console.error("  Could not resolve RA ID — skipping"); return; }
 
     if (!dryRun) {
